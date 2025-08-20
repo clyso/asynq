@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,9 +26,8 @@ const LeaseDuration = 30 * time.Second
 
 // RDB is a client interface to query and mutate task queues.
 type RDB struct {
-	client          redis.UniversalClient
-	clock           timeutil.Clock
-	queuesPublished sync.Map
+	client redis.UniversalClient
+	clock  timeutil.Clock
 }
 
 // NewRDB returns a new instance of RDB.
@@ -87,10 +85,12 @@ func (r *RDB) runScriptWithErrorCode(ctx context.Context, op errors.Op, script *
 // Input:
 // KEYS[1] -> asynq:{<qname>}:t:<task_id>
 // KEYS[2] -> asynq:{<qname>}:pending
+// KEYS[3] -> asynq:queues
 // --
 // ARGV[1] -> task message data
 // ARGV[2] -> task ID
 // ARGV[3] -> current unix time in nsec
+// ARGV[4] -> queue name
 //
 // Output:
 // Returns 1 if successfully enqueued
@@ -104,6 +104,7 @@ redis.call("HSET", KEYS[1],
            "state", "pending",
            "pending_since", ARGV[3])
 redis.call("LPUSH", KEYS[2], ARGV[2])
+redis.call("SADD", KEYS[3], ARGV[4])
 return 1
 `)
 
@@ -114,20 +115,16 @@ func (r *RDB) Enqueue(ctx context.Context, msg *base.TaskMessage) error {
 	if err != nil {
 		return errors.E(op, errors.Unknown, fmt.Sprintf("cannot encode message: %v", err))
 	}
-	if _, found := r.queuesPublished.Load(msg.Queue); !found {
-		if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
-			return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
-		}
-		r.queuesPublished.Store(msg.Queue, true)
-	}
 	keys := []string{
 		base.TaskKey(msg.Queue, msg.ID),
 		base.PendingKey(msg.Queue),
+		base.AllQueues,
 	}
 	argv := []interface{}{
 		encoded,
 		msg.ID,
 		r.clock.Now().UnixNano(),
+		msg.Queue,
 	}
 	n, err := r.runScriptWithErrorCode(ctx, op, enqueueCmd, keys, argv...)
 	if err != nil {
@@ -144,11 +141,13 @@ func (r *RDB) Enqueue(ctx context.Context, msg *base.TaskMessage) error {
 // KEYS[1] -> unique key
 // KEYS[2] -> asynq:{<qname>}:t:<taskid>
 // KEYS[3] -> asynq:{<qname>}:pending
+// KEYS[4] -> asynq:queues
 // --
 // ARGV[1] -> task ID
 // ARGV[2] -> uniqueness lock TTL
 // ARGV[3] -> task message data
 // ARGV[4] -> current unix time in nsec
+// ARGV[5] -> queue name
 //
 // Output:
 // Returns 1 if successfully enqueued
@@ -168,6 +167,7 @@ redis.call("HSET", KEYS[2],
            "pending_since", ARGV[4],
            "unique_key", KEYS[1])
 redis.call("LPUSH", KEYS[3], ARGV[1])
+redis.call("SADD", KEYS[4], ARGV[5])
 return 1
 `)
 
@@ -179,22 +179,18 @@ func (r *RDB) EnqueueUnique(ctx context.Context, msg *base.TaskMessage, ttl time
 	if err != nil {
 		return errors.E(op, errors.Internal, "cannot encode task message: %v", err)
 	}
-	if _, found := r.queuesPublished.Load(msg.Queue); !found {
-		if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
-			return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
-		}
-		r.queuesPublished.Store(msg.Queue, true)
-	}
 	keys := []string{
 		msg.UniqueKey,
 		base.TaskKey(msg.Queue, msg.ID),
 		base.PendingKey(msg.Queue),
+		base.AllQueues,
 	}
 	argv := []interface{}{
 		msg.ID,
 		int(ttl.Seconds()),
 		encoded,
 		r.clock.Now().UnixNano(),
+		msg.Queue,
 	}
 	n, err := r.runScriptWithErrorCode(ctx, op, enqueueUniqueCmd, keys, argv...)
 	if err != nil {
@@ -509,11 +505,13 @@ func (r *RDB) Requeue(ctx context.Context, msg *base.TaskMessage) error {
 // KEYS[1] -> asynq:{<qname>}:t:<task_id>
 // KEYS[2] -> asynq:{<qname>}:g:<group_key>
 // KEYS[3] -> asynq:{<qname>}:groups
+// KEYS[4] -> asynq:queues
 // -------
 // ARGV[1] -> task message data
 // ARGV[2] -> task ID
 // ARGV[3] -> current time in Unix time
 // ARGV[4] -> group key
+// ARGV[5] -> queue name
 //
 // Output:
 // Returns 1 if successfully added
@@ -528,6 +526,7 @@ redis.call("HSET", KEYS[1],
 	       "group", ARGV[4])
 redis.call("ZADD", KEYS[2], ARGV[3], ARGV[2])
 redis.call("SADD", KEYS[3], ARGV[4])
+redis.call("SADD", KEYS[4], ARGV[5])
 return 1
 `)
 
@@ -537,22 +536,18 @@ func (r *RDB) AddToGroup(ctx context.Context, msg *base.TaskMessage, groupKey st
 	if err != nil {
 		return errors.E(op, errors.Unknown, fmt.Sprintf("cannot encode message: %v", err))
 	}
-	if _, found := r.queuesPublished.Load(msg.Queue); !found {
-		if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
-			return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
-		}
-		r.queuesPublished.Store(msg.Queue, true)
-	}
 	keys := []string{
 		base.TaskKey(msg.Queue, msg.ID),
 		base.GroupKey(msg.Queue, groupKey),
 		base.AllGroups(msg.Queue),
+		base.AllQueues,
 	}
 	argv := []interface{}{
 		encoded,
 		msg.ID,
 		r.clock.Now().Unix(),
 		groupKey,
+		msg.Queue,
 	}
 	n, err := r.runScriptWithErrorCode(ctx, op, addToGroupCmd, keys, argv...)
 	if err != nil {
@@ -568,12 +563,14 @@ func (r *RDB) AddToGroup(ctx context.Context, msg *base.TaskMessage, groupKey st
 // KEYS[2] -> asynq:{<qname>}:g:<group_key>
 // KEYS[3] -> asynq:{<qname>}:groups
 // KEYS[4] -> unique key
+// KEYS[5] -> asynq:queues
 // -------
 // ARGV[1] -> task message data
 // ARGV[2] -> task ID
 // ARGV[3] -> current time in Unix time
 // ARGV[4] -> group key
 // ARGV[5] -> uniqueness lock TTL
+// ARGV[6] -> queue name
 //
 // Output:
 // Returns 1 if successfully added
@@ -593,6 +590,7 @@ redis.call("HSET", KEYS[1],
 	       "group", ARGV[4])
 redis.call("ZADD", KEYS[2], ARGV[3], ARGV[2])
 redis.call("SADD", KEYS[3], ARGV[4])
+redis.call("SADD", KEYS[5], ARGV[6])
 return 1
 `)
 
@@ -602,17 +600,12 @@ func (r *RDB) AddToGroupUnique(ctx context.Context, msg *base.TaskMessage, group
 	if err != nil {
 		return errors.E(op, errors.Unknown, fmt.Sprintf("cannot encode message: %v", err))
 	}
-	if _, found := r.queuesPublished.Load(msg.Queue); !found {
-		if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
-			return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
-		}
-		r.queuesPublished.Store(msg.Queue, true)
-	}
 	keys := []string{
 		base.TaskKey(msg.Queue, msg.ID),
 		base.GroupKey(msg.Queue, groupKey),
 		base.AllGroups(msg.Queue),
 		base.UniqueKey(msg.Queue, msg.Type, msg.Payload),
+		base.AllQueues,
 	}
 	argv := []interface{}{
 		encoded,
@@ -620,6 +613,7 @@ func (r *RDB) AddToGroupUnique(ctx context.Context, msg *base.TaskMessage, group
 		r.clock.Now().Unix(),
 		groupKey,
 		int(ttl.Seconds()),
+		msg.Queue,
 	}
 	n, err := r.runScriptWithErrorCode(ctx, op, addToGroupUniqueCmd, keys, argv...)
 	if err != nil {
@@ -636,10 +630,12 @@ func (r *RDB) AddToGroupUnique(ctx context.Context, msg *base.TaskMessage, group
 
 // KEYS[1] -> asynq:{<qname>}:t:<task_id>
 // KEYS[2] -> asynq:{<qname>}:scheduled
+// KEYS[3] -> asynq:queues
 // -------
 // ARGV[1] -> task message data
 // ARGV[2] -> process_at time in Unix time
 // ARGV[3] -> task ID
+// ARGV[4] -> queue name
 //
 // Output:
 // Returns 1 if successfully enqueued
@@ -652,6 +648,7 @@ redis.call("HSET", KEYS[1],
            "msg", ARGV[1],
            "state", "scheduled")
 redis.call("ZADD", KEYS[2], ARGV[2], ARGV[3])
+redis.call("SADD", KEYS[3], ARGV[4])
 return 1
 `)
 
@@ -662,20 +659,16 @@ func (r *RDB) Schedule(ctx context.Context, msg *base.TaskMessage, processAt tim
 	if err != nil {
 		return errors.E(op, errors.Unknown, fmt.Sprintf("cannot encode message: %v", err))
 	}
-	if _, found := r.queuesPublished.Load(msg.Queue); !found {
-		if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
-			return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
-		}
-		r.queuesPublished.Store(msg.Queue, true)
-	}
 	keys := []string{
 		base.TaskKey(msg.Queue, msg.ID),
 		base.ScheduledKey(msg.Queue),
+		base.AllQueues,
 	}
 	argv := []interface{}{
 		encoded,
 		processAt.Unix(),
 		msg.ID,
+		msg.Queue,
 	}
 	n, err := r.runScriptWithErrorCode(ctx, op, scheduleCmd, keys, argv...)
 	if err != nil {
@@ -690,11 +683,13 @@ func (r *RDB) Schedule(ctx context.Context, msg *base.TaskMessage, processAt tim
 // KEYS[1] -> unique key
 // KEYS[2] -> asynq:{<qname>}:t:<task_id>
 // KEYS[3] -> asynq:{<qname>}:scheduled
+// KEYS[4] -> asynq:queues
 // -------
 // ARGV[1] -> task ID
 // ARGV[2] -> uniqueness lock TTL
 // ARGV[3] -> score (process_at timestamp)
 // ARGV[4] -> task message
+// ARGV[5] -> queue name
 //
 // Output:
 // Returns 1 if successfully scheduled
@@ -713,6 +708,7 @@ redis.call("HSET", KEYS[2],
            "state", "scheduled",
            "unique_key", KEYS[1])
 redis.call("ZADD", KEYS[3], ARGV[3], ARGV[1])
+redis.call("SADD", KEYS[4], ARGV[5])
 return 1
 `)
 
@@ -724,22 +720,18 @@ func (r *RDB) ScheduleUnique(ctx context.Context, msg *base.TaskMessage, process
 	if err != nil {
 		return errors.E(op, errors.Internal, fmt.Sprintf("cannot encode task message: %v", err))
 	}
-	if _, found := r.queuesPublished.Load(msg.Queue); !found {
-		if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
-			return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
-		}
-		r.queuesPublished.Store(msg.Queue, true)
-	}
 	keys := []string{
 		msg.UniqueKey,
 		base.TaskKey(msg.Queue, msg.ID),
 		base.ScheduledKey(msg.Queue),
+		base.AllQueues,
 	}
 	argv := []interface{}{
 		msg.ID,
 		int(ttl.Seconds()),
 		processAt.Unix(),
 		encoded,
+		msg.Queue,
 	}
 	n, err := r.runScriptWithErrorCode(ctx, op, scheduleUniqueCmd, keys, argv...)
 	if err != nil {
