@@ -421,6 +421,18 @@ func TestInspectorGetQueueInfo(t *testing.T) {
 
 }
 
+func TestInspectorGetQueueInfoNotFound(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+
+	inspector := NewInspector(getRedisConnOpt(t))
+	h.FlushDB(t, r)
+	_, err := inspector.GetQueueInfo("nonexistent")
+	if !errors.Is(err, ErrQueueNotFound) {
+		t.Errorf("GetQueueInfo returned unexpected error: %v, want ErrQueueNotFound", err)
+	}
+}
+
 func TestInspectorHistory(t *testing.T) {
 	r := setup(t)
 	defer r.Close()
