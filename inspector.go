@@ -142,6 +142,9 @@ func (i *Inspector) GetQueueInfo(queue string) (*QueueInfo, error) {
 		return nil, err
 	}
 	stats, err := i.rdb.CurrentStats(queue)
+	if errors.IsQueueNotFound(err) {
+		return nil, fmt.Errorf("%w: queue=%q", ErrQueueNotFound, queue)
+	}
 	if err != nil {
 		return nil, err
 	}
