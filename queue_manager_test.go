@@ -154,11 +154,14 @@ func newDynamicQueueManagerWithMock(t *testing.T, queues map[string]int, mock *q
 }
 
 type queueGetterMock struct {
+	mu          sync.Mutex
 	queues      map[string]struct{}
 	returnError error
 }
 
 func (q *queueGetterMock) SetQueues(queues []string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	q.queues = make(map[string]struct{}, len(queues))
 	for _, queue := range queues {
 		q.queues[queue] = struct{}{}
@@ -166,6 +169,8 @@ func (q *queueGetterMock) SetQueues(queues []string) {
 }
 
 func (q *queueGetterMock) GetQueues(ctx context.Context) (map[string]struct{}, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	if q.returnError != nil {
 		return nil, q.returnError
 	}
