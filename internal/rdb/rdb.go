@@ -62,7 +62,7 @@ func (r *RDB) Ping() error {
 
 func (r *RDB) runScript(ctx context.Context, op errors.Op, script *redis.Script, keys []string, args ...interface{}) error {
 	if err := script.Run(ctx, r.client, keys, args...).Err(); err != nil {
-		return errors.E(op, errors.Internal, fmt.Sprintf("redis eval error: %v", err))
+		return errors.E(op, errors.Internal, fmt.Errorf("redis eval error: %w", err))
 	}
 	return nil
 }
@@ -71,7 +71,7 @@ func (r *RDB) runScript(ctx context.Context, op errors.Op, script *redis.Script,
 func (r *RDB) runScriptWithErrorCode(ctx context.Context, op errors.Op, script *redis.Script, keys []string, args ...interface{}) (int64, error) {
 	res, err := script.Run(ctx, r.client, keys, args...).Result()
 	if err != nil {
-		return 0, errors.E(op, errors.Unknown, fmt.Sprintf("redis eval error: %v", err))
+		return 0, errors.E(op, errors.Unknown, fmt.Errorf("redis eval error: %w", err))
 	}
 	n, ok := res.(int64)
 	if !ok {
@@ -134,6 +134,106 @@ func (r *RDB) Enqueue(ctx context.Context, msg *base.TaskMessage) error {
 		return errors.E(op, errors.AlreadyExists, errors.ErrTaskIdConflict)
 	}
 	return nil
+}
+
+// BatchEnqueue adds all given tasks to Redis using a single pipeline round-trip.
+// Each item is either enqueued immediately (ProcessAt is zero) or added to the
+// scheduled sorted set.
+//
+// WARNING: tasks whose IDs already exist in Redis are silently skipped.
+//
+// The pipeline executes independent Lua scripts per task — there is no
+// MULTI/EXEC wrapping the batch, so individual tasks may succeed or fail
+// independently. The returned int is the number of tasks actually written;
+// skipped duplicates do not count. The returned error is non-nil only when the
+// pipeline call itself fails (network error, context cancellation, etc.), in
+// which case no individual result should be trusted.
+//
+// Message encoding errors cause an immediate return before any Redis I/O.
+func (r *RDB) BatchEnqueue(ctx context.Context, items []base.BatchEnqueueItem) (int, error) {
+	var op errors.Op = "rdb.BatchEnqueue"
+	if len(items) == 0 {
+		return 0, nil
+	}
+
+	// Preload Lua scripts so that EVALSHA inside the pipeline does not fail with
+	// NOSCRIPT. Script.Run on a pipeline only sends EVALSHA (unlike non-pipeline
+	// Run which retries with EVAL on NOSCRIPT).
+	needsEnqueue, needsSchedule := false, false
+	for _, item := range items {
+		if item.ProcessAt.IsZero() {
+			needsEnqueue = true
+		} else {
+			needsSchedule = true
+		}
+		if needsEnqueue && needsSchedule {
+			break
+		}
+	}
+	if needsEnqueue {
+		if err := enqueueCmd.Load(ctx, r.client).Err(); err != nil {
+			return 0, errors.E(op, errors.Unknown, fmt.Errorf("failed to load enqueue script: %w", err))
+		}
+	}
+	if needsSchedule {
+		if err := scheduleCmd.Load(ctx, r.client).Err(); err != nil {
+			return 0, errors.E(op, errors.Unknown, fmt.Errorf("failed to load schedule script: %w", err))
+		}
+	}
+
+	pipe := r.client.Pipeline()
+
+	// Track which pipeline slot holds each item's script result.
+	scriptIdxs := make([]int, 0, len(items))
+	pipeLen := 0
+
+	now := r.clock.Now().UnixNano()
+
+	for _, item := range items {
+		encoded, err := base.EncodeMessage(item.Msg)
+		if err != nil {
+			return 0, errors.E(op, errors.Unknown, fmt.Sprintf("cannot encode message: %v", err))
+		}
+		if item.ProcessAt.IsZero() {
+			keys := []string{
+				base.TaskKey(item.Msg.Queue, item.Msg.ID),
+				base.PendingKey(item.Msg.Queue),
+				base.AllQueues,
+			}
+			argv := []interface{}{encoded, item.Msg.ID, now, item.Msg.Queue}
+			enqueueCmd.Run(ctx, pipe, keys, argv...)
+		} else {
+			keys := []string{
+				base.TaskKey(item.Msg.Queue, item.Msg.ID),
+				base.ScheduledKey(item.Msg.Queue),
+				base.AllQueues,
+			}
+			argv := []interface{}{encoded, item.ProcessAt.Unix(), item.Msg.ID, item.Msg.Queue}
+			scheduleCmd.Run(ctx, pipe, keys, argv...)
+		}
+		scriptIdxs = append(scriptIdxs, pipeLen)
+		pipeLen++
+	}
+
+	cmds, err := pipe.Exec(ctx)
+	if err != nil && err != redis.Nil {
+		return 0, errors.E(op, errors.Unknown, fmt.Errorf("redis pipeline error: %w", err))
+	}
+
+	enqueued := 0
+	for _, idx := range scriptIdxs {
+		if idx >= len(cmds) {
+			continue
+		}
+		res, err := cmds[idx].(*redis.Cmd).Result()
+		if err != nil {
+			continue
+		}
+		if n, ok := res.(int64); ok && n == 1 {
+			enqueued++
+		}
+	}
+	return enqueued, nil
 }
 
 // enqueueUniqueCmd enqueues the task message if the task is unique.
@@ -255,7 +355,7 @@ func (r *RDB) Dequeue(qnames ...string) (msg *base.TaskMessage, leaseExpirationT
 		if err == redis.Nil {
 			continue
 		} else if err != nil {
-			return nil, time.Time{}, errors.E(op, errors.Unknown, fmt.Sprintf("redis eval error: %v", err))
+			return nil, time.Time{}, errors.E(op, errors.Unknown, fmt.Errorf("redis eval error: %w", err))
 		}
 		encoded, err := cast.ToStringE(res)
 		if err != nil {
@@ -983,7 +1083,7 @@ func (r *RDB) forward(delayedKey, pendingKey, taskKeyPrefix, groupKeyPrefix stri
 	}
 	res, err := forwardCmd.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
-		return 0, errors.E(errors.Internal, fmt.Sprintf("redis eval error: %v", err))
+		return 0, errors.E(errors.Internal, fmt.Errorf("redis eval error: %w", err))
 	}
 	n, err := cast.ToIntE(res)
 	if err != nil {
@@ -1175,7 +1275,7 @@ func (r *RDB) ReadAggregationSet(qname, gname, setID string) ([]*base.TaskMessag
 	res, err := readAggregationSetCmd.Run(ctx, r.client,
 		[]string{aggSetKey}, base.TaskKeyPrefix(qname)).Result()
 	if err != nil {
-		return nil, time.Time{}, errors.E(op, errors.Unknown, fmt.Sprintf("redis eval error: %v", err))
+		return nil, time.Time{}, errors.E(op, errors.Unknown, fmt.Errorf("redis eval error: %w", err))
 	}
 	data, err := cast.ToStringSliceE(res)
 	if err != nil {
@@ -1293,7 +1393,7 @@ func (r *RDB) deleteExpiredCompletedTasks(qname string, batchSize int) (int64, e
 	}
 	res, err := deleteExpiredCompletedTasksCmd.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
-		return 0, errors.E(op, errors.Internal, fmt.Sprintf("redis eval error: %v", err))
+		return 0, errors.E(op, errors.Internal, fmt.Errorf("redis eval error: %w", err))
 	}
 	n, ok := res.(int64)
 	if !ok {
@@ -1327,7 +1427,7 @@ func (r *RDB) ListLeaseExpired(cutoff time.Time, qnames ...string) ([]*base.Task
 			[]string{base.LeaseKey(qname)},
 			cutoff.Unix(), base.TaskKeyPrefix(qname)).Result()
 		if err != nil {
-			return nil, errors.E(op, errors.Internal, fmt.Sprintf("redis eval error: %v", err))
+			return nil, errors.E(op, errors.Internal, fmt.Errorf("redis eval error: %w", err))
 		}
 		data, err := cast.ToStringSliceE(res)
 		if err != nil {
@@ -1480,7 +1580,8 @@ func (r *RDB) CancelationPubSub() (*redis.PubSub, error) {
 	pubsub := r.client.Subscribe(ctx, base.CancelChannel)
 	_, err := pubsub.Receive(ctx)
 	if err != nil {
-		return nil, errors.E(op, errors.Unknown, fmt.Sprintf("redis pubsub receive error: %v", err))
+		pubsub.Close()
+		return nil, errors.E(op, errors.Unknown, fmt.Errorf("redis pubsub receive error: %w", err))
 	}
 	return pubsub, nil
 }
@@ -1491,7 +1592,7 @@ func (r *RDB) PublishCancelation(id string) error {
 	var op errors.Op = "rdb.PublishCancelation"
 	ctx := context.Background()
 	if err := r.client.Publish(ctx, base.CancelChannel, id).Err(); err != nil {
-		return errors.E(op, errors.Unknown, fmt.Sprintf("redis pubsub publish error: %v", err))
+		return errors.E(op, errors.Unknown, fmt.Errorf("redis pubsub publish error: %w", err))
 	}
 	return nil
 }
